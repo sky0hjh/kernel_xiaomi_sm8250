@@ -2630,6 +2630,8 @@ static int _sde_encoder_rc_pre_modeset(struct drm_encoder *drm_enc,
 			goto end;
 		}
 
+		msm_idle_set_state(drm_enc, false);
+
 		_sde_encoder_update_rsc_client(drm_enc, true);
 
 		SDE_EVT32(DRMID(drm_enc), sw_event, sde_enc->rc_state,
@@ -2730,6 +2732,8 @@ static int _sde_encoder_rc_idle(struct drm_encoder *drm_enc,
 		_sde_encoder_irq_control(drm_enc, false);
 		sde_kms_update_pm_qos_irq_request(sde_kms, false, false);
 	} else {
+		msm_idle_set_state(drm_enc, true);
+
 		/* disable all the clks and resources */
 		_sde_encoder_update_rsc_client(drm_enc, false);
 		_sde_encoder_resource_control_helper(drm_enc, false);
@@ -2800,6 +2804,8 @@ static int _sde_encoder_rc_early_wakeup(struct drm_encoder *drm_enc,
 					SDE_EVTLOG_ERROR);
 			goto end;
 		}
+
+		msm_idle_set_state(drm_enc, false);
 
 		_sde_encoder_update_rsc_client(drm_enc, true);
 
