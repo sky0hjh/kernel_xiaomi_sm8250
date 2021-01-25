@@ -30,6 +30,7 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_mode.h>
 #include <drm/drm_print.h>
+#include <linux/pm_qos.h>
 #include <drm/drm_writeback.h>
 #include <linux/pm_qos.h>
 #include <linux/sync_file.h>
