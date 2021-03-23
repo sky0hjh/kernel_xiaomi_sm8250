@@ -220,6 +220,7 @@ static void ufshcd_update_uic_error_cnt(struct ufs_hba *hba, u32 reg, int type)
 /* UIC command timeout, unit: ms */
 #define UIC_CMD_TIMEOUT	500
 
+#define UIC_MI_CMD_TIMEOUT	3000
 /* NOP OUT retries waiting for NOP IN response */
 #define NOP_OUT_RETRIES    10
 /* Timeout after 30 msecs if NOP OUT hangs without response */
@@ -228,7 +229,7 @@ static void ufshcd_update_uic_error_cnt(struct ufs_hba *hba, u32 reg, int type)
 /* Query request retries */
 #define QUERY_REQ_RETRIES 3
 /* Query request timeout */
-#define QUERY_REQ_TIMEOUT 1500 /* 1.5 seconds */
+#define QUERY_REQ_TIMEOUT 3000 /* 3.0 seconds */
 
 /* Task management command timeout */
 #define TM_CMD_TIMEOUT	100 /* msecs */
@@ -466,6 +467,8 @@ static struct ufs_dev_fix ufs_fixups[] = {
 	UFS_FIX(UFS_VENDOR_SAMSUNG, "KLUEG8UHDB-C2D1",
 		UFS_DEVICE_QUIRK_PA_HIBER8TIME),
 	UFS_FIX(UFS_VENDOR_SAMSUNG, "KLUDG4UHDB-B2D1",
+		UFS_DEVICE_QUIRK_PA_HIBER8TIME),
+	UFS_FIX(UFS_VENDOR_SAMSUNG, "KLUFG8RHDA-B2D1",
 		UFS_DEVICE_QUIRK_PA_HIBER8TIME),
 	END_FIX
 };
@@ -3988,7 +3991,7 @@ static int ufshcd_wait_for_dev_cmd(struct ufs_hba *hba,
 		ufshcd_outstanding_req_clear(hba, lrbp->task_tag);
 	}
 
-	if (err)
+	if (err && err != -EAGAIN)
 		ufsdbg_set_err_state(hba);
 
 	return err;
@@ -5158,7 +5161,7 @@ static int ufshcd_uic_pwr_ctrl(struct ufs_hba *hba, struct uic_command *cmd)
 
 more_wait:
 	if (!wait_for_completion_timeout(hba->uic_async_done,
-					 msecs_to_jiffies(UIC_CMD_TIMEOUT))) {
+					 msecs_to_jiffies(UIC_MI_CMD_TIMEOUT))) {
 		u32 intr_status = 0;
 		s64 ts_since_last_intr;
 
@@ -5672,9 +5675,10 @@ EXPORT_SYMBOL_GPL(ufshcd_config_pwr_mode);
  */
 static int ufshcd_complete_dev_init(struct ufs_hba *hba)
 {
-	int i;
+	int i = 0;
 	int err;
 	bool flag_res = 1;
+	ktime_t timeout;
 
 	err = ufshcd_query_flag_retry(hba, UPIU_QUERY_OPCODE_SET_FLAG,
 		QUERY_FLAG_IDN_FDEVICEINIT, NULL);
@@ -5685,10 +5689,30 @@ static int ufshcd_complete_dev_init(struct ufs_hba *hba)
 		goto out;
 	}
 
-	/* poll for max. 1000 iterations for fDeviceInit flag to clear */
-	for (i = 0; i < 1000 && !err && flag_res; i++)
+	/*
+	* Some vendor devices are taking longer time to complete its internal
+	* initialization, so set fDeviceInit flag poll time to 5 secs
+	*/
+	timeout = ktime_add_ms(ktime_get(), 5000);
+
+	/* poll for max. 5sec for fDeviceInit flag to clear */
+	while (1) {
+		bool timedout = ktime_after(ktime_get(), timeout);
 		err = ufshcd_query_flag_retry(hba, UPIU_QUERY_OPCODE_READ_FLAG,
 			QUERY_FLAG_IDN_FDEVICEINIT, &flag_res);
+		if (err || !flag_res || timedout)
+			break;
+
+		/*
+		* Poll for this flag in a tight loop for first 1000 iterations.
+		* This is same as old logic which is working for most of the
+		* devices, so continue using the same.
+		*/
+		if (i == 1000)
+			msleep(20);
+		else
+			i++;
+	}
 
 	if (err)
 		dev_err(hba->dev,
@@ -6084,37 +6108,6 @@ static int ufshcd_get_lu_wp(struct ufs_hba *hba,
 					  UNIT_DESC_PARAM_LU_WR_PROTECT,
 					  b_lu_write_protect,
 					  sizeof(*b_lu_write_protect));
-	return ret;
-}
-
-/*
- * ufshcd_get_wb_alloc_units - returns "dLUNumWriteBoosterBufferAllocUnits"
- * @hba: per-adapter instance
- * @lun: UFS device lun id
- * @d_lun_wbb_au: pointer to buffer to hold the LU's alloc units info
- *
- * Returns 0 in case of success and d_lun_wbb_au would be returned
- * Returns -ENOTSUPP if reading d_lun_wbb_au is not supported.
- * Returns -EINVAL in case of invalid parameters passed to this function.
- */
-static int ufshcd_get_wb_alloc_units(struct ufs_hba *hba,
-			    u8 lun,
-			    u8 *d_lun_wbb_au)
-{
-	int ret;
-
-	if (!d_lun_wbb_au)
-		ret = -EINVAL;
-
-	/* WB can be supported only from LU0..LU7 */
-	else if (lun >= UFS_UPIU_MAX_GENERAL_LUN)
-		ret = -ENOTSUPP;
-	else
-		ret = ufshcd_read_unit_desc_param(hba,
-					  lun,
-					  UNIT_DESC_PARAM_WB_BUF_ALLOC_UNITS,
-					  d_lun_wbb_au,
-					  sizeof(*d_lun_wbb_au));
 	return ret;
 }
 
@@ -8498,8 +8491,7 @@ static int ufs_get_device_desc(struct ufs_hba *hba,
 	int err;
 	size_t buff_len;
 	u8 model_index;
-	u8 *desc_buf, wb_buf[4];
-	u32 lun, res;
+	u8 *desc_buf;
 
 	buff_len = max_t(size_t, hba->desc_size.dev_desc,
 			 QUERY_DESC_MAX_SIZE + 1);
@@ -8529,7 +8521,6 @@ static int ufs_get_device_desc(struct ufs_hba *hba,
 
 	/* Enable WB only for UFS-3.1 or UFS-2.2 OR if desc len >= 0x59 */
 	if ((dev_desc->wspecversion >= 0x310) ||
-	    (dev_desc->wspecversion == 0x220) ||
 	    (dev_desc->wmanufacturerid == UFS_VENDOR_TOSHIBA &&
 	     dev_desc->wspecversion >= 0x300 &&
 	     hba->desc_size.dev_desc >= 0x59)) {
@@ -8541,29 +8532,8 @@ static int ufs_get_device_desc(struct ufs_hba *hba,
 			desc_buf[DEVICE_DESC_PARAM_EXT_UFS_FEATURE_SUP + 2]
 								<< 8 |
 			desc_buf[DEVICE_DESC_PARAM_EXT_UFS_FEATURE_SUP + 3];
-		hba->dev_info.b_wb_buffer_type =
-			desc_buf[DEVICE_DESC_PARAM_WB_TYPE];
-
-		if (hba->dev_info.b_wb_buffer_type)
-			goto skip_unit_desc;
-
-		hba->dev_info.wb_config_lun = false;
-		for (lun = 0; lun < UFS_UPIU_MAX_GENERAL_LUN; lun++) {
-			memset(wb_buf, 0, sizeof(wb_buf));
-			err = ufshcd_get_wb_alloc_units(hba, lun, wb_buf);
-			if (err)
-				break;
-
-			res = wb_buf[0] << 24 | wb_buf[1] << 16 |
-				wb_buf[2] << 8 | wb_buf[3];
-			if (res) {
-				hba->dev_info.wb_config_lun = true;
-				break;
-			}
-		}
 	}
 
-skip_unit_desc:
 	/* Zero-pad entire buffer for string termination. */
 	memset(desc_buf, 0, buff_len);
 
@@ -9198,6 +9168,12 @@ reinit:
 		scsi_scan_host(hba->host);
 		pm_runtime_put_sync(hba->dev);
 	}
+
+	/*
+	 * Enable auto hibern8 if supported, after full host and
+	 * device initialization.
+	 */
+	ufshcd_set_auto_hibern8_timer(hba);
 
 out:
 	if (ret) {
