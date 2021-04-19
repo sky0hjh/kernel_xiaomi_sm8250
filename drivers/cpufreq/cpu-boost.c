@@ -51,7 +51,9 @@ static DEFINE_PER_CPU(struct cpu_sync, sync_info);
 
 static struct kthread_work input_boost_work;
 
-static struct work_struct powerkey_input_boost_work;
+static struct kthread_work powerkey_input_boost_work;
+static struct kthread_worker powerkey_cpu_boost_worker;
+static struct task_struct *powerkey_cpu_boost_worker_thread;
 static bool input_boost_enabled;
 
 static unsigned int input_boost_ms = 40;
@@ -322,7 +324,7 @@ static void do_input_boost(struct kthread_work *work)
 	schedule_delayed_work(&input_boost_rem, msecs_to_jiffies(input_boost_ms));
 }
 
-static void do_powerkey_input_boost(struct work_struct *work)
+static void do_powerkey_input_boost(struct kthread_work *work)
 {
 
 	unsigned int i, ret;
@@ -352,8 +354,7 @@ static void do_powerkey_input_boost(struct work_struct *work)
 			sched_boost_active = true;
 	}
 
-	queue_delayed_work(cpu_boost_wq, &input_boost_rem,
-					msecs_to_jiffies(powerkey_input_boost_ms));
+	schedule_delayed_work(&input_boost_rem, msecs_to_jiffies(powerkey_input_boost_ms));
 }
 
 static void cpuboost_input_event(struct input_handle *handle,
@@ -372,7 +373,7 @@ static void cpuboost_input_event(struct input_handle *handle,
 		return;
 
 	if (type == EV_KEY && code == KEY_POWER) {
-		queue_work(cpu_boost_wq, &powerkey_input_boost_work);
+		kthread_queue_work(&cpu_boost_worker, &powerkey_input_boost_work);
 	} else {
 		kthread_queue_work(&cpu_boost_worker, &input_boost_work);
 	}
@@ -389,10 +390,10 @@ void touch_irq_boost(void)
 	if (now - last_input_time < MIN_INPUT_INTERVAL)
 		return;
 
-	if (work_pending(&input_boost_work))
+	if (queuing_blocked(&cpu_boost_worker,&input_boost_work))
 		return;
 
-	queue_work(cpu_boost_wq, &input_boost_work);
+	kthread_queue_work(&cpu_boost_worker, &input_boost_work);
 
 	last_input_time = ktime_to_us(ktime_get());
 }
@@ -495,14 +496,28 @@ static int cpu_boost_init(void)
 	if (ret)
 		pr_err("cpu-boost: Failed to set SCHED_FIFO!\n");
 
+	kthread_init_worker(&powerkey_cpu_boost_worker);
+	powerkey_cpu_boost_worker_thread = kthread_create(kthread_worker_fn,
+		&powerkey_cpu_boost_worker, "powerkey_cpu_boost_worker_thread");
+	if (IS_ERR(powerkey_cpu_boost_worker_thread)) {
+		pr_err("powerkey_cpu-boost: Failed to init kworker!\n");
+		return -EFAULT;
+	}
+
+	ret = sched_setscheduler(powerkey_cpu_boost_worker_thread, SCHED_FIFO, &param);
+	if (ret)
+		pr_err("powerkey_cpu-boost: Failed to set SCHED_FIFO!\n");
+
 	/* Now bind it to the cpumask */
 	kthread_bind_mask(cpu_boost_worker_thread, &sys_bg_mask);
+	kthread_bind_mask(powerkey_cpu_boost_worker_thread, &sys_bg_mask);
 
 	/* Wake it up! */
 	wake_up_process(cpu_boost_worker_thread);
+	wake_up_process(powerkey_cpu_boost_worker_thread);
 
 	kthread_init_work(&input_boost_work, do_input_boost);
-	INIT_WORK(&powerkey_input_boost_work, do_powerkey_input_boost);
+	kthread_init_work(&powerkey_input_boost_work, do_powerkey_input_boost);
 	INIT_DELAYED_WORK(&input_boost_rem, do_input_boost_rem);
 
 	for_each_possible_cpu(cpu) {
