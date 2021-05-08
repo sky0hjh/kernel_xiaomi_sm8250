@@ -9,7 +9,7 @@ int global = 0;
 int india = 0;
 int version_b = 0;
 
-void get_info() {
+void get_info(void) {
     hw_platform_ver = get_hw_version_platform();
     hw_country_ver = get_hw_country_version();
     hw_version_major = get_hw_version_major();
